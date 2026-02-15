@@ -6,7 +6,6 @@ import streamlit as st
 import requests
 import folium
 from folium.plugins import HeatMap
-from folium.features import DivIcon
 from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Mapa de Ocorrências (Satélite)", layout="wide")
@@ -17,15 +16,18 @@ OCORR_URL  = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRVklJXAZVXK0GQYS5
 
 # ----------------- Helpers -----------------
 def parse_coord(val) -> float:
+    """Aceita -13.010079 / -13,010079 / -13.010.079"""
     s = str(val).strip()
     if s == "" or s.lower() == "nan":
         return float("nan")
+
     s = s.replace(",", ".")
     if s.count(".") > 1:
         neg = s.startswith("-")
         s2 = s[1:] if neg else s
         parts = s2.split(".")
         s = ("-" if neg else "") + parts[0] + "." + "".join(parts[1:])
+
     s = re.sub(r"[^0-9\.\-]", "", s)
     try:
         return float(s)
@@ -44,6 +46,7 @@ def read_published_csv(url: str) -> pd.DataFrame:
 
 def build_weight(agg: pd.DataFrame, mode: str, cap_pct: float, gamma: float) -> pd.Series:
     base = agg["registros"].astype(float).copy()
+
     if cap_pct < 100:
         cap = float(np.nanpercentile(base.values, cap_pct))
         base = base.clip(upper=cap)
@@ -74,57 +77,33 @@ def format_postos_label(postos_list, max_names=3):
     return " | ".join(shown) + f"  +{len(nomes) - max_names}"
 
 
-def add_count_label(map_obj, lat, lon, text):
-    # número bem no centro
-    folium.Marker(
-        location=[lat, lon],
-        icon=DivIcon(
-            icon_size=(30, 30),
-            icon_anchor=(15, 15),
-            html=f"""
-            <div style="
-                font-size:12px;
-                font-weight:800;
-                color:white;
-                text-align:center;
-                text-shadow: 0 0 3px rgba(0,0,0,0.95);
-            ">{text}</div>
-            """
-        ),
-    ).add_to(map_obj)
-
-
-def add_postos_label_below(map_obj, lat, lon, text, offset_lat=0.00018):
+def make_permanent_tooltip_html(label_postos: str, total: int, show_postos: bool, show_total: bool) -> str:
     """
-    Coloca o rótulo *logo abaixo* do ponto, deslocando a latitude.
-    Em Salvador, 0.00018 ~ 20m (aprox), bom para ficar "embaixo" visualmente.
-    Ajuste fino se quiser.
+    Tooltip permanente (sempre visível) ANCORADO no próprio ponto.
+    Fica 'logo abaixo' via direction='bottom' + offset.
     """
-    lat2 = lat - offset_lat
-    folium.Marker(
-        location=[lat2, lon],
-        icon=DivIcon(
-            icon_size=(300, 28),
-            icon_anchor=(150, 0),
-            html=f"""
-            <div style="
-                font-size:11px;
-                font-weight:900;
-                color:white;
-                text-align:center;
-                text-shadow: 0 0 3px rgba(0,0,0,0.95);
-                background: rgba(0,0,0,0.28);
-                padding: 2px 8px;
-                border-radius: 8px;
-                display:inline-block;
-                max-width: 300px;
-                overflow:hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-            ">{text}</div>
-            """
-        ),
-    ).add_to(map_obj)
+    parts = []
+    if show_total:
+        parts.append(f"<div style='font-size:12px;font-weight:900;color:#fff;'>{total}</div>")
+    if show_postos and label_postos:
+        parts.append(f"<div style='font-size:11px;font-weight:800;color:#fff;'>{label_postos}</div>")
+
+    inner = "".join(parts) if parts else ""
+    return f"""
+    <div style="
+        background: rgba(0,0,0,0.28);
+        padding: 2px 8px;
+        border-radius: 8px;
+        text-align: center;
+        text-shadow: 0 0 3px rgba(0,0,0,0.95);
+        white-space: nowrap;
+        max-width: 320px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        ">
+        {inner}
+    </div>
+    """
 
 
 # ----------------- UI -----------------
@@ -147,13 +126,12 @@ with st.sidebar:
     show_points = st.checkbox("Mostrar ponto (popup agrupado)", True)
 
     # ✅ DESLIGADOS POR PADRÃO
-    show_counts = st.checkbox("Mostrar número total no mapa", False)
-    show_postos_names = st.checkbox("Mostrar nomes dos postos (abaixo do ponto)", False)
+    show_total_on_map = st.checkbox("Mostrar total no mapa (ancorado)", False)
+    show_postos_on_map = st.checkbox("Mostrar nomes dos postos no mapa (ancorado)", False)
 
     max_names = st.slider("Qtd. nomes no rótulo", 1, 10, 4)
-    offset_lat = st.slider("Distância do rótulo abaixo (m)", 5, 60, 20)
-    # conversão aproximada: 1 grau lat ~ 111.000 m
-    offset_lat_deg = float(offset_lat) / 111000.0
+
+    st.caption("Obs.: rótulos permanentes podem se sobrepor se os pontos estiverem muito próximos (mas não trocam de ponto).")
 
 if force_refresh:
     read_published_csv.clear()
@@ -163,7 +141,7 @@ try:
     postos = read_published_csv(POSTOS_URL)
     ocorr = read_published_csv(OCORR_URL)
 except Exception as e:
-    st.error("Erro lendo os CSVs publicados.")
+    st.error("Erro lendo os CSVs publicados. Confirme que os links abrem CSV no navegador.")
     st.exception(e)
     st.stop()
 
@@ -179,6 +157,7 @@ if not need_ocorr.issubset(set(ocorr.columns)):
     st.error(f"OCORRÊNCIAS precisa ter colunas: {sorted(list(need_ocorr))}. Encontradas: {ocorr.columns.tolist()}")
     st.stop()
 
+# ----------------- Normalize / parse -----------------
 postos["posto"] = postos["posto"].astype(str).str.strip()
 postos["lat"] = postos["lat"].apply(parse_coord)
 postos["long"] = postos["long"].apply(parse_coord)
@@ -263,16 +242,37 @@ folium.TileLayer(
 heat = agg_total[["lat", "long", "peso"]].values.tolist()
 HeatMap(heat, radius=heat_radius, blur=heat_blur, max_zoom=17, name="Mapa de calor").add_to(m)
 
-# Marcadores / rótulos
+# Marcadores + rótulos PERMANENTES ancorados
 for _, row in agg_total.iterrows():
     lat, lon = float(row["lat"]), float(row["long"])
     total = int(row["registros"])
 
+    # label por postos do ponto (curto)
+    postos_here = by_posto[(by_posto["lat"] == lat) & (by_posto["long"] == lon)]
+    label_postos = format_postos_label(postos_here["posto"].tolist(), max_names=max_names)
+
+    # tooltip permanente (só se alguma opção ligada)
+    tooltip = None
+    if show_total_on_map or show_postos_on_map:
+        html = make_permanent_tooltip_html(
+            label_postos=label_postos,
+            total=total,
+            show_postos=show_postos_on_map,
+            show_total=show_total_on_map,
+        )
+        tooltip = folium.Tooltip(
+            html,
+            permanent=True,
+            sticky=False,
+            direction="bottom",
+            offset=(0, 14),  # <- "imediatamente abaixo" do ponto
+            opacity=0.95,
+        )
+
     if show_points:
-        postos_here = by_posto[(by_posto["lat"] == lat) & (by_posto["long"] == lon)]
         nat_here = by_nat[(by_nat["lat"] == lat) & (by_nat["long"] == lon)].head(8)
 
-        postos_list = "<br>".join(
+        postos_list_popup = "<br>".join(
             [f"• {p['posto']} — {int(p['registros_posto'])}" for _, p in postos_here.iterrows()]
         ) or "—"
 
@@ -283,7 +283,7 @@ for _, row in agg_total.iterrows():
         popup_html = f"""
         <div style="font-family: Arial; font-size: 13px; line-height: 1.35; width: 330px;">
           <b>Total no ponto:</b> {total}<br><br>
-          <b>Postos neste local:</b><br>{postos_list}<br><br>
+          <b>Postos neste local:</b><br>{postos_list_popup}<br><br>
           <b>Principais naturezas (top 8):</b><br>{nat_list}
         </div>
         """
@@ -291,19 +291,19 @@ for _, row in agg_total.iterrows():
         folium.CircleMarker(
             location=[lat, lon],
             radius=10,
-            tooltip=f"Total: {total}",
+            tooltip=tooltip,
             popup=folium.Popup(popup_html, max_width=420),
             fill=True,
         ).add_to(m)
-
-    if show_counts:
-        add_count_label(m, lat, lon, str(total))
-
-    if show_postos_names:
-        postos_here = by_posto[(by_posto["lat"] == lat) & (by_posto["long"] == lon)]
-        label = format_postos_label(postos_here["posto"].tolist(), max_names=max_names)
-        if label:
-            add_postos_label_below(m, lat, lon, label, offset_lat=offset_lat_deg)
+    else:
+        # Se não mostrar ponto, mas quiser rótulo permanente, ainda cria o círculo sem popup
+        if tooltip is not None:
+            folium.CircleMarker(
+                location=[lat, lon],
+                radius=10,
+                tooltip=tooltip,
+                fill=True,
+            ).add_to(m)
 
 folium.LayerControl(collapsed=False).add_to(m)
 
