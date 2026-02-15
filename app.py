@@ -1,80 +1,198 @@
+import io
 import re
+import numpy as np
 import pandas as pd
 import streamlit as st
+import requests
 import folium
-from folium.plugins import HeatMap, MarkerCluster
+from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 
-# ✅ Seu link "Publicar na Web" (CSV)
-SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSkRLXhmtl4pogs_exuOvZYVctyVFksBQC-KwUkKLXQa0GRZIedH9CORgQc0cgEJbOpBNrTvZR8T1l6/pub?output=csv"
+st.set_page_config(page_title="Mapa de Ocorrências (Satélite)", layout="wide")
 
-st.set_page_config(page_title="Mapa de Calor - Postos", layout="wide")
+# ✅ LINKS FIXOS (Google Sheets publicado)
+POSTOS_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRVklJXAZVXK0GQYS5HbR6mSynqbvxoEIjgJbcIyZR7SZU-jud4peyg2_VBNcq8zmBHF472JGtZBC9R/pub?gid=0&single=true&output=csv"
+OCORR_URL  = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRVklJXAZVXK0GQYS5HbR6mSynqbvxoEIjgJbcIyZR7SZU-jud4peyg2_VBNcq8zmBHF472JGtZBC9R/pub?gid=164488321&single=true&output=csv"
 
-@st.cache_data(ttl=60)
-def load_data(url: str) -> pd.DataFrame:
-    df = pd.read_csv(url)
-    df.columns = [c.strip().lower() for c in df.columns]
-    return df
 
+# ----------------- Helpers -----------------
 def parse_coord(val) -> float:
+    """
+    Aceita:
+    - -13.010079
+    - -13,010079
+    - -13.010.079  (corrige removendo pontos "a mais")
+    """
     s = str(val).strip()
     if s == "" or s.lower() == "nan":
         return float("nan")
+
     s = s.replace(",", ".")
-    if s.count(".") > 1:  # ex: -13.010.079 -> -13.010079
+    if s.count(".") > 1:
         neg = s.startswith("-")
         s2 = s[1:] if neg else s
         parts = s2.split(".")
         s = ("-" if neg else "") + parts[0] + "." + "".join(parts[1:])
+
     s = re.sub(r"[^0-9\.\-]", "", s)
+
     try:
         return float(s)
     except:
         return float("nan")
 
-df = load_data(SHEET_CSV_URL)
 
-# ✅ SEUS NOMES DE COLUNA
-col_posto = "posto"
-col_lat = "lat"
-col_lon = "long"
-col_reg = "registros"
+@st.cache_data(ttl=60)
+def read_published_csv(url: str) -> pd.DataFrame:
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30, allow_redirects=True)
+    r.raise_for_status()
+    df = pd.read_csv(io.StringIO(r.text))
+    df.columns = [c.strip().lower() for c in df.columns]
+    return df
 
-# validação rápida
-need = [col_posto, col_lat, col_lon, col_reg]
-missing = [c for c in need if c not in df.columns]
-if missing:
-    st.error(f"Faltando coluna(s): {missing}")
-    st.write("Colunas encontradas:", df.columns.tolist())
-    st.stop()
 
-df[col_lat] = df[col_lat].apply(parse_coord)
-df[col_lon] = df[col_lon].apply(parse_coord)
-df[col_reg] = pd.to_numeric(df[col_reg], errors="coerce").fillna(0)
+def build_weight(agg: pd.DataFrame, mode: str, cap_pct: float, gamma: float) -> pd.Series:
+    """
+    agg tem coluna 'registros' (int)
+    retorna uma série 'peso' para o heatmap (float)
+    """
+    base = agg["registros"].astype(float).copy()
 
-df = df.dropna(subset=[col_lat, col_lon])
+    # cap para reduzir efeito de outliers
+    if cap_pct < 100:
+        cap = float(np.nanpercentile(base.values, cap_pct))
+        base = base.clip(upper=cap)
 
-st.title("Mapa de calor (satélite) — Postos x Registros")
+    if mode == "Bruto":
+        peso = base
+    elif mode == "Log":
+        peso = np.log1p(base)
+    elif mode == "Raiz":
+        peso = np.sqrt(base)
+    elif mode == "Gamma":
+        mx = float(base.max()) if float(base.max()) > 0 else 1.0
+        norm = base / mx
+        peso = np.power(norm, 1.0 / max(gamma, 0.1))
+    else:
+        peso = np.log1p(base)
+
+    return peso.fillna(0.0)
+
+
+# ----------------- UI -----------------
+st.title("Mapa de Ocorrências (satélite) — Postos x Registros")
 
 with st.sidebar:
-    st.header("Filtros")
-    min_r = int(df[col_reg].min())
-    max_r = int(df[col_reg].max())
-    r_range = st.slider("Faixa de registros", min_r, max_r, (min_r, max_r))
-    show_markers = st.checkbox("Mostrar pontos clicáveis", True)
-    heat_radius = st.slider("Raio do heatmap", 10, 80, 35)
-    heat_blur = st.slider("Blur do heatmap", 10, 80, 25)
+    st.header("Atualização")
+    force_refresh = st.button("Atualizar agora (ignorar cache)")
+
+    st.header("Heatmap (sensibilidade)")
+    weight_mode = st.selectbox("Modo de peso", ["Log", "Bruto", "Raiz", "Gamma"], index=0)
+    cap_pct = st.slider("Cap (percentil do topo)", 80, 100, 95, help="95 = corta outliers acima do p95")
+    gamma = st.slider("Gamma (apenas no modo Gamma)", 0.6, 3.0, 1.7, 0.1)
+
+    heat_radius = st.slider("Raio do heatmap", 10, 80, 25)
+    heat_blur = st.slider("Blur do heatmap", 5, 80, 15)
     zoom = st.slider("Zoom inicial", 10, 18, 13)
+    show_points = st.checkbox("Mostrar ponto (popup agrupado)", True)
 
-df_f = df[(df[col_reg] >= r_range[0]) & (df[col_reg] <= r_range[1])]
+if force_refresh:
+    read_published_csv.clear()
 
-center = [
-    float(df_f[col_lat].mean()) if len(df_f) else float(df[col_lat].mean()),
-    float(df_f[col_lon].mean()) if len(df_f) else float(df[col_lon].mean())
-]
+# ----------------- Load -----------------
+try:
+    postos = read_published_csv(POSTOS_URL)
+    ocorr = read_published_csv(OCORR_URL)
+except Exception as e:
+    st.error("Erro lendo os CSVs publicados. Confirme que os links abrem CSV no navegador.")
+    st.exception(e)
+    st.stop()
+
+# ----------------- Validate columns -----------------
+need_postos = {"posto", "lat", "long"}
+need_ocorr = {"posto", "natureza", "datahora"}
+
+if not need_postos.issubset(set(postos.columns)):
+    st.error(f"POSTOS precisa ter colunas: {sorted(list(need_postos))}. Encontradas: {postos.columns.tolist()}")
+    st.stop()
+
+if not need_ocorr.issubset(set(ocorr.columns)):
+    st.error(f"OCORRÊNCIAS precisa ter colunas: {sorted(list(need_ocorr))}. Encontradas: {ocorr.columns.tolist()}")
+    st.stop()
+
+# ----------------- Normalize / parse -----------------
+postos["posto"] = postos["posto"].astype(str).str.strip()
+postos["lat"] = postos["lat"].apply(parse_coord)
+postos["long"] = postos["long"].apply(parse_coord)
+postos = postos.dropna(subset=["lat", "long"])
+
+ocorr["posto"] = ocorr["posto"].astype(str).str.strip()
+ocorr["natureza"] = ocorr["natureza"].astype(str).str.strip()
+
+# datahora BR: "13/02/2026 09:04"
+ocorr["datahora"] = pd.to_datetime(ocorr["datahora"], dayfirst=True, errors="coerce")
+ocorr = ocorr.dropna(subset=["datahora"])
+
+# ----------------- Join occurrences to coords -----------------
+df = ocorr.merge(postos[["posto", "lat", "long"]], on="posto", how="left")
+
+missing = int(df["lat"].isna().sum())
+if missing:
+    st.warning(f"{missing} ocorrência(s) com 'posto' não cadastrado na aba POSTOS (ficaram sem lat/long).")
+    df = df.dropna(subset=["lat", "long"])
+
+# ----------------- Filters: período e natureza -----------------
+with st.sidebar:
+    st.header("Filtros")
+    min_dt = df["datahora"].min().to_pydatetime()
+    max_dt = df["datahora"].max().to_pydatetime()
+
+    dt_ini = st.date_input("Data inicial", value=min_dt.date())
+    dt_fim = st.date_input("Data final", value=max_dt.date())
+
+    naturas = sorted(df["natureza"].dropna().unique().tolist())
+    natureza_sel = st.multiselect("Natureza (opcional)", options=naturas, default=[])
+
+df_f = df[(df["datahora"].dt.date >= dt_ini) & (df["datahora"].dt.date <= dt_fim)]
+if natureza_sel:
+    df_f = df_f[df_f["natureza"].isin(natureza_sel)]
+
+if df_f.empty:
+    st.warning("Sem dados com os filtros atuais.")
+    st.stop()
+
+# ----------------- Aggregate: 1 ponto por coordenada -----------------
+agg_total = (
+    df_f.groupby(["lat", "long"])
+    .size()
+    .reset_index(name="registros")
+)
+
+# pesos para o heatmap (contraste)
+agg_total["peso"] = build_weight(agg_total, weight_mode, cap_pct, gamma)
+
+# breakdown por posto no ponto (para popup)
+by_posto = (
+    df_f.groupby(["lat", "long", "posto"])
+    .size()
+    .reset_index(name="registros_posto")
+    .sort_values(["lat", "long", "registros_posto"], ascending=[True, True, False])
+)
+
+# breakdown por natureza no ponto (para popup)
+by_nat = (
+    df_f.groupby(["lat", "long", "natureza"])
+    .size()
+    .reset_index(name="registros_nat")
+    .sort_values(["lat", "long", "registros_nat"], ascending=[True, True, False])
+)
+
+# ----------------- Map -----------------
+center = [float(agg_total["lat"].mean()), float(agg_total["long"].mean())]
 
 m = folium.Map(location=center, zoom_start=zoom, control_scale=True, tiles=None)
 
+# Satélite (Esri)
 folium.TileLayer(
     tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
     attr="Tiles © Esri",
@@ -83,6 +201,7 @@ folium.TileLayer(
     control=True,
 ).add_to(m)
 
+# Rótulos
 folium.TileLayer(
     tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
     attr="Esri",
@@ -92,27 +211,45 @@ folium.TileLayer(
     opacity=0.9,
 ).add_to(m)
 
-heat = df_f[[col_lat, col_lon, col_reg]].values.tolist()
+# Heatmap com "peso" (sensibilidade)
+heat = agg_total[["lat", "long", "peso"]].values.tolist()
 HeatMap(heat, radius=heat_radius, blur=heat_blur, max_zoom=17, name="Mapa de calor").add_to(m)
 
-if show_markers:
-    cluster = MarkerCluster(name="Postos (clicáveis)").add_to(m)
-    for _, r in df_f.iterrows():
-        posto = str(r[col_posto]).strip()
-        reg = int(r[col_reg]) if pd.notna(r[col_reg]) else 0
-        popup = folium.Popup(
-            f"<b>Posto:</b> {posto}<br><b>Registros:</b> {reg}<br><b>Coords:</b> {r[col_lat]:.6f},{r[col_lon]:.6f}",
-            max_width=350
-        )
+# Pontos agregados (1 por coordenada)
+if show_points:
+    for _, row in agg_total.iterrows():
+        lat, lon = float(row["lat"]), float(row["long"])
+        total = int(row["registros"])
+
+        postos_here = by_posto[(by_posto["lat"] == lat) & (by_posto["long"] == lon)]
+        nat_here = by_nat[(by_nat["lat"] == lat) & (by_nat["long"] == lon)].head(8)
+
+        postos_list = "<br>".join(
+            [f"• {p['posto']} — {int(p['registros_posto'])}" for _, p in postos_here.iterrows()]
+        ) or "—"
+
+        nat_list = "<br>".join(
+            [f"• {n['natureza']} — {int(n['registros_nat'])}" for _, n in nat_here.iterrows()]
+        ) or "—"
+
+        popup_html = f"""
+        <div style="font-family: Arial; font-size: 13px; line-height: 1.35; width: 330px;">
+          <b>Total no ponto:</b> {total}<br><br>
+          <b>Postos neste local:</b><br>{postos_list}<br><br>
+          <b>Principais naturezas (top 8):</b><br>{nat_list}
+        </div>
+        """
+
         folium.CircleMarker(
-            location=[r[col_lat], r[col_lon]],
-            radius=6,
-            tooltip=f"{posto} ({reg})",
-            popup=popup,
-            fill=True
-        ).add_to(cluster)
+            location=[lat, lon],
+            radius=7,
+            tooltip=f"Total: {total}",
+            popup=folium.Popup(popup_html, max_width=420),
+            fill=True,
+        ).add_to(m)
 
 folium.LayerControl(collapsed=False).add_to(m)
-st_folium(m, use_container_width=True, height=700)
 
-st.caption("Atualização automática: lê o CSV publicado no Google Sheets (cache ~60s).")
+st_folium(m, use_container_width=True, height=720)
+
+st.caption("Atualiza lendo os CSVs publicados (cache ~60s). Use 'Atualizar agora' para forçar recarga.")
